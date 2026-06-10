@@ -1,0 +1,429 @@
+from fastapi import FastAPI, HTTPException
+
+app = FastAPI(
+    title="netinspect",
+    description="A network intelligence API.",
+    version="1.0.0",
+)
+
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/", summary="API index")
+def root():
+    """Returns a list of all available endpoints."""
+    return {
+        "name": "netinspect",
+        "description": "A network intelligence API",
+        "docs": "/docs",
+        "endpoints": [
+            "GET /dns/{domain}",
+            "GET /whois/{domain}",
+            "GET /ssl/{domain}",
+            "GET /ip/{ip}",
+            "GET /headers/{domain}",
+            "GET /ports/{host}",
+            "GET /redirects/{domain}",
+            "POST /bulk",
+        ],
+    }
+
+
+import dns.resolver
+import whois
+
+
+@app.get("/dns/{domain}", summary="DNS lookup")
+def dns_lookup(domain: str, record_type: str = "A"):
+    """Look up DNS records for a domain."""
+    try:
+        record_type = record_type.upper()
+        answers = dns.resolver.resolve(domain, record_type)
+        records = [r.to_text() for r in answers]
+        return {"domain": domain, "record_type": record_type, "records": records}
+    except dns.resolver.NXDOMAIN:
+        raise HTTPException(status_code=404, detail=f"Domain {domain} does not exist")
+    except dns.resolver.NoAnswer:
+        raise HTTPException(status_code=404, detail=f"No {record_type} records found for {domain}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/whois/{domain}", summary="WHOIS lookup")
+def whois_lookup(domain: str):
+    """Get WHOIS registration info for a domain."""
+    try:
+        w = whois.whois(domain)
+        return {
+            "domain": domain,
+            "registrar": w.registrar,
+            "creation_date": str(w.creation_date),
+            "expiration_date": str(w.expiration_date),
+            "updated_date": str(w.updated_date),
+            "name_servers": w.name_servers,
+            "status": w.status,
+            "emails": w.emails,
+            "country": w.country,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+import ssl
+import socket
+import requests
+
+
+@app.get("/ssl/{domain}", summary="SSL certificate info")
+def ssl_info(domain: str):
+    """Get SSL certificate details for a domain."""
+    try:
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
+            s.settimeout(5)
+            s.connect((domain, 443))
+            cert = s.getpeercert()
+
+        subject = {k: v for (k, v) in (x[0] for x in cert.get("subject", []))}
+        issuer = {k: v for (k, v) in (x[0] for x in cert.get("issuer", []))}
+
+        return {
+            "domain": domain,
+            "subject": subject,
+            "issuer": issuer,
+            "valid_from": cert.get("notBefore"),
+            "valid_until": cert.get("notAfter"),
+            "serial_number": cert.get("serialNumber"),
+            "version": cert.get("version"),
+            "san": [x[1] for x in cert.get("subjectAltName", [])],
+        }
+    except ssl.SSLCertVerificationError as e:
+        raise HTTPException(status_code=400, detail=f"SSL verification failed: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ip/{ip}", summary="IP geolocation & info")
+def ip_info(ip: str):
+    """Get geolocation, ASN, and network info for an IP address."""
+    try:
+        response = requests.get(f"http://ip-api.com/json/{ip}?fields=66846719", timeout=5)
+        data = response.json()
+        if data.get("status") == "fail":
+            raise HTTPException(status_code=404, detail=data.get("message", "IP lookup failed"))
+        return {
+            "ip": ip,
+            "country": data.get("country"),
+            "country_code": data.get("countryCode"),
+            "region": data.get("regionName"),
+            "city": data.get("city"),
+            "zip": data.get("zip"),
+            "lat": data.get("lat"),
+            "lon": data.get("lon"),
+            "timezone": data.get("timezone"),
+            "isp": data.get("isp"),
+            "org": data.get("org"),
+            "asn": data.get("as"),
+            "is_proxy": data.get("proxy"),
+            "is_hosting": data.get("hosting"),
+            "is_mobile": data.get("mobile"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/headers/{domain}", summary="HTTP response headers")
+def get_headers(domain: str):
+    """Fetch HTTP response headers from a domain."""
+    try:
+        url = domain if domain.startswith("http") else f"https://{domain}"
+        response = requests.get(url, timeout=5, allow_redirects=True)
+        return {"domain": domain, "status_code": response.status_code, "headers": dict(response.headers)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/redirects/{domain}", summary="Redirect chain")
+def redirect_chain(domain: str):
+    """Follow and return the full redirect chain for a domain."""
+    try:
+        url = domain if domain.startswith("http") else f"https://{domain}"
+        response = requests.get(url, timeout=10, allow_redirects=True)
+        chain = [{"url": r.url, "status_code": r.status_code} for r in response.history]
+        chain.append({"url": response.url, "status_code": response.status_code})
+        return {"domain": domain, "hops": len(chain), "chain": chain}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ports/{host}", summary="Common port scan")
+def port_scan(host: str):
+    """Check if common ports are open on a host."""
+    common_ports = {
+        21: "FTP",
+        22: "SSH",
+        25: "SMTP",
+        53: "DNS",
+        80: "HTTP",
+        443: "HTTPS",
+        3306: "MySQL",
+        5432: "PostgreSQL",
+        6379: "Redis",
+        8080: "HTTP-Alt",
+        8443: "HTTPS-Alt",
+        27017: "MongoDB",
+    }
+    results = {}
+    for port, service in common_ports.items():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex((host, port))
+            results[port] = {"service": service, "open": result == 0}
+            sock.close()
+        except Exception:
+            results[port] = {"service": service, "open": False}
+
+    return {"host": host, "ports": results}
+
+
+@app.post("/bulk", summary="Bulk domain lookup")
+def bulk_lookup(domains: list[str]):
+    """Run a basic DNS + SSL check on multiple domains at once.
+
+    POST a JSON array of domain strings: ["example.com", "google.com"]
+    """
+    if len(domains) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 domains per bulk request")
+
+    results = {}
+    for domain in domains:
+        entry = {}
+        # DNS
+        try:
+            answers = dns.resolver.resolve(domain, "A")
+            entry["dns_a"] = [r.to_text() for r in answers]
+        except Exception as e:
+            entry["dns_a"] = f"error: {str(e)}"
+        # SSL
+        try:
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
+                s.settimeout(5)
+                s.connect((domain, 443))
+                cert = s.getpeercert()
+            entry["ssl_valid_until"] = cert.get("notAfter")
+            issuer = {k: v for (k, v) in (x[0] for x in cert.get("issuer", []))}
+            entry["ssl_issuer"] = issuer.get("organizationName")
+        except Exception as e:
+            entry["ssl"] = f"error: {str(e)}"
+        results[domain] = entry
+
+    return {"results": results}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+@app.get("/dns/{domain}", summary="DNS lookup")
+def dns_lookup(domain: str, record_type: str = "A"):
+    """Look up DNS records for a domain."""
+    try:
+        record_type = record_type.upper()
+        answers = dns.resolver.resolve(domain, record_type)
+        records = [r.to_text() for r in answers]
+        return {"domain": domain, "record_type": record_type, "records": records}
+    except dns.resolver.NXDOMAIN:
+        raise HTTPException(status_code=404, detail=f"Domain {domain} does not exist")
+    except dns.resolver.NoAnswer:
+        raise HTTPException(status_code=404, detail=f"No {record_type} records found for {domain}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/whois/{domain}", summary="WHOIS lookup")
+def whois_lookup(domain: str):
+    """Get WHOIS registration info for a domain."""
+    try:
+        w = whois.whois(domain)
+        return {
+            "domain": domain,
+            "registrar": w.registrar,
+            "creation_date": str(w.creation_date),
+            "expiration_date": str(w.expiration_date),
+            "updated_date": str(w.updated_date),
+            "name_servers": w.name_servers,
+            "status": w.status,
+            "emails": w.emails,
+            "country": w.country,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ssl/{domain}", summary="SSL certificate info")
+def ssl_info(domain: str):
+    """Get SSL certificate details for a domain."""
+    try:
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
+            s.settimeout(5)
+            s.connect((domain, 443))
+            cert = s.getpeercert()
+
+        subject = {k: v for (k, v) in (x[0] for x in cert.get("subject", []))}
+        issuer = {k: v for (k, v) in (x[0] for x in cert.get("issuer", []))}
+
+        return {
+            "domain": domain,
+            "subject": subject,
+            "issuer": issuer,
+            "valid_from": cert.get("notBefore"),
+            "valid_until": cert.get("notAfter"),
+            "serial_number": cert.get("serialNumber"),
+            "version": cert.get("version"),
+            "san": [x[1] for x in cert.get("subjectAltName", [])],
+        }
+    except ssl.SSLCertVerificationError as e:
+        raise HTTPException(status_code=400, detail=f"SSL verification failed: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ip/{ip}", summary="IP geolocation & info")
+def ip_info(ip: str):
+    """Get geolocation, ASN, and network info for an IP address."""
+    try:
+        response = requests.get(f"http://ip-api.com/json/{ip}?fields=66846719", timeout=5)
+        data = response.json()
+        if data.get("status") == "fail":
+            raise HTTPException(status_code=404, detail=data.get("message", "IP lookup failed"))
+        return {
+            "ip": ip,
+            "country": data.get("country"),
+            "country_code": data.get("countryCode"),
+            "region": data.get("regionName"),
+            "city": data.get("city"),
+            "zip": data.get("zip"),
+            "lat": data.get("lat"),
+            "lon": data.get("lon"),
+            "timezone": data.get("timezone"),
+            "isp": data.get("isp"),
+            "org": data.get("org"),
+            "asn": data.get("as"),
+            "is_proxy": data.get("proxy"),
+            "is_hosting": data.get("hosting"),
+            "is_mobile": data.get("mobile"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/headers/{domain}", summary="HTTP response headers")
+def get_headers(domain: str):
+    """Fetch HTTP response headers from a domain."""
+    try:
+        url = domain if domain.startswith("http") else f"https://{domain}"
+        response = requests.get(url, timeout=5, allow_redirects=True)
+        return {"domain": domain, "status_code": response.status_code, "headers": dict(response.headers)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/redirects/{domain}", summary="Redirect chain")
+def redirect_chain(domain: str):
+    """Follow and return the full redirect chain for a domain."""
+    try:
+        url = domain if domain.startswith("http") else f"https://{domain}"
+        response = requests.get(url, timeout=10, allow_redirects=True)
+        chain = [{"url": r.url, "status_code": r.status_code} for r in response.history]
+        chain.append({"url": response.url, "status_code": response.status_code})
+        return {"domain": domain, "hops": len(chain), "chain": chain}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ports/{host}", summary="Common port scan")
+def port_scan(host: str):
+    """Check if common ports are open on a host."""
+    common_ports = {
+        21: "FTP",
+        22: "SSH",
+        25: "SMTP",
+        53: "DNS",
+        80: "HTTP",
+        443: "HTTPS",
+        3306: "MySQL",
+        5432: "PostgreSQL",
+        6379: "Redis",
+        8080: "HTTP-Alt",
+        8443: "HTTPS-Alt",
+        27017: "MongoDB",
+    }
+    results = {}
+    for port, service in common_ports.items():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex((host, port))
+            results[port] = {"service": service, "open": result == 0}
+            sock.close()
+        except Exception:
+            results[port] = {"service": service, "open": False}
+
+    return {"host": host, "ports": results}
+
+
+@app.post("/bulk", summary="Bulk domain lookup")
+def bulk_lookup(domains: list[str]):
+    """Run a basic DNS + SSL check on multiple domains at once.
+
+    POST a JSON array of domain strings: ["example.com", "google.com"]
+    """
+    if len(domains) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 domains per bulk request")
+
+    results = {}
+    for domain in domains:
+        entry = {}
+        # DNS
+        try:
+            answers = dns.resolver.resolve(domain, "A")
+            entry["dns_a"] = [r.to_text() for r in answers]
+        except Exception as e:
+            entry["dns_a"] = f"error: {str(e)}"
+        # SSL
+        try:
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
+                s.settimeout(5)
+                s.connect((domain, 443))
+                cert = s.getpeercert()
+            entry["ssl_valid_until"] = cert.get("notAfter")
+            issuer = {k: v for (k, v) in (x[0] for x in cert.get("issuer", []))}
+            entry["ssl_issuer"] = issuer.get("organizationName")
+        except Exception as e:
+            entry["ssl"] = f"error: {str(e)}"
+        results[domain] = entry
+
+    return {"results": results}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
